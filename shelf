@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""shelf — a context-budgeted store for tools you might use on a future project.
+
+Notes live in $SHELF_DIR/items/*.md as markdown with YAML-ish frontmatter. Optional
+shallow clones live in $SHELF_DIR/repos/ and are gitignored.
+
+The design constraint is that this output usually lands in an AI agent's context
+window, so `find` is ranked and hard-capped while the browsable views are kept
+out of the agent's reach. See README.md for measured costs.
+
+Stdlib only. Python 3.8+.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+__version__ = "0.1.0"
+
+FIELDS = ("name", "url", "tags", "added", "verdict", "stars", "license", "pushed", "desc", "why")
+VERDICTS = ("untried", "trialling", "adopted", "rejected")
+VERDICT_ORDER = {v: i for i, v in enumerate(("adopted", "trialling", "untried", "rejected"))}
+WHY_CAP = 110
+DEFAULT_HITS = 8
+
+TEMPLATE = """
+## What it is
+
+## When I'd reach for it
+
+## Why not now
+
+## If I trial it
+"""
+
+
+# ---------------------------------------------------------------- paths & io
+
+def shelf_dir() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("SHELF_DIR", pathlib.Path.home() / ".shelf")).expanduser()
+
+
+def items_dir() -> pathlib.Path:
+    return shelf_dir() / "items"
+
+
+def repos_dir() -> pathlib.Path:
+    return shelf_dir() / "repos"
+
+
+def die(msg: str, code: int = 1):
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def ensure_shelf():
+    if not items_dir().is_dir():
+        die(f"no shelf at {shelf_dir()} — run `shelf init` first")
+
+
+def colour_on() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+# ---------------------------------------------------------------- item model
+
+def slugify(value: str) -> str:
+    value = re.sub(r"^https?://", "", value.strip().lower())
+    value = value.rstrip("/").split("/")[-1]
+    value = re.sub(r"\.git$", "", value)
+    value = re.sub(r"[^a-z0-9._-]+", "-", value)
+    return value.strip("-") or "item"
+
+
+def parse(path: pathlib.Path) -> dict:
+    text = path.read_text(encoding="utf-8")
+    item = {k: "" for k in FIELDS}
+    item.update(name=path.stem, body="", path=path)
+    if not text.startswith("---"):
+        item["body"] = text
+        return item
+    head, _, body = text.partition("---")[2].partition("---")
+    for line in head.strip().splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key not in FIELDS:
+            continue
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        item[key] = value.strip("[]") if key == "tags" else value
+    item["body"] = body
+    return item
+
+
+def load() -> list:
+    items = [parse(p) for p in sorted(items_dir().glob("*.md"))]
+    return sorted(items, key=lambda i: i.get("added", ""), reverse=True)
+
+
+def tags_of(item: dict) -> list:
+    return [t.strip() for t in item["tags"].split(",") if t.strip()]
+
+
+def clip(text: str, cap: int = WHY_CAP) -> str:
+    text = " ".join(text.split())
+    if len(text) <= cap:
+        return text
+    return text[: cap - 1].rsplit(" ", 1)[0] + "…"
+
+
+def gh_meta(url: str) -> dict:
+    """Enrich a GitHub URL with stars/license/last-push. Never fatal — the shelf
+    works fine offline, it just records less."""
+    m = re.match(r"^https?://github\.com/([^/]+/[^/#?]+)", url.strip())
+    if not m:
+        return {}
+    repo = re.sub(r"\.git$", "", m.group(1))
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"shelf/{__version__}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            d = json.load(resp)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return {}
+    return {
+        "stars": str(d.get("stargazers_count", "")),
+        "license": (d.get("license") or {}).get("spdx_id") or "none",
+        "pushed": (d.get("pushed_at") or "")[:10],
+        "desc": d.get("description") or "",
+    }
+
+
+def write_item(slug: str, fields: dict, body: str = TEMPLATE) -> pathlib.Path:
+    lines = ["---"]
+    for key in FIELDS:
+        value = fields.get(key, "")
+        if not value:
+            continue
+        if key == "tags":
+            lines.append(f"tags: [{value}]")
+        elif key in ("why", "desc"):
+            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        else:
+            lines.append(f"{key}: {value}")
+    lines += ["---", body.rstrip() + "\n"]
+    path = items_dir() / f"{slug}.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(args):
+    for d in (items_dir(), repos_dir()):
+        d.mkdir(parents=True, exist_ok=True)
+    gitignore = shelf_dir() / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("repos/\n", encoding="utf-8")
+    if not (shelf_dir() / ".git").exists() and shutil.which("git"):
+        subprocess.run(["git", "init", "-q"], cwd=shelf_dir(), check=False)
+    render_index()
+    print(f"shelf ready at {shelf_dir()}")
+    print("  add your first item:  shelf add <url> -w \"why it caught your eye\" -t tag")
+
+
+def cmd_add(args):
+    ensure_shelf()
+    slug = args.slug or slugify(args.url)
+    path = items_dir() / f"{slug}.md"
+    if path.exists():
+        die(f"already shelved: {path}\n  edit it with `shelf edit {slug}`")
+    fields = {
+        "name": slug,
+        "url": args.url,
+        "tags": ",".join(t.strip() for t in args.tags.split(",") if t.strip()) if args.tags else "",
+        "added": datetime.date.today().isoformat(),
+        "verdict": "untried",
+        "why": args.why or "",
+    }
+    if not args.offline:
+        fields.update(gh_meta(args.url))
+    write_item(slug, fields)
+    if args.clone:
+        clone_repo(slug)
+    render_index()
+    print(f"shelved → {path}")
+    print(f"  now fill in the note: shelf edit {slug}")
+
+
+def clone_repo(slug: str):
+    item = parse(items_dir() / f"{slug}.md") if (items_dir() / f"{slug}.md").exists() else None
+    if item is None:
+        die(f"no such item: {slug}")
+    url = item["url"]
+    if not re.search(r"github\.com|gitlab\.com|\.git$", url):
+        die(f"not a git url: {url}")
+    dest = repos_dir() / slug
+    if dest.exists():
+        print(f"already cloned: {dest}")
+        return
+    repos_dir().mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(["git", "clone", "--depth", "1", "-q", url, str(dest)], check=False)
+    if result.returncode:
+        die(f"clone failed: {url}")
+    print(f"cloned → {dest}")
+
+
+def cmd_clone(args):
+    ensure_shelf()
+    clone_repo(args.slug)
+
+
+def score(item: dict, terms: list) -> int:
+    """Weight name and tag hits above body hits so precision holds as the shelf grows."""
+    total = 0
+    for term in terms:
+        pat = re.compile(re.escape(term), re.I)
+        total += 10 if pat.search(item["name"]) else 0
+        total += 6 if any(pat.search(t) for t in tags_of(item)) else 0
+        total += 4 if pat.search(item["why"]) else 0
+        total += 1 if pat.search(item["body"]) else 0
+    return total
+
+
+def cmd_find(args):
+    ensure_shelf()
+    items = load()
+    terms = [t for t in args.query if t.strip()]
+    hits = sorted(
+        [(score(i, terms), i) for i in items if score(i, terms) > 0], key=lambda p: -p[0]
+    )
+    if not hits:
+        print(f"nothing shelved matches: {' '.join(terms)}")
+        print(f"({len(items)} items on the shelf — `shelf tags` for the vocabulary)")
+        return
+    for _, i in hits[: args.n]:
+        print(f"{i['name']}  [{i['verdict'] or 'untried'}]  {i['url']}")
+        if i["why"]:
+            print(f"    {clip(i['why'])}")
+    if len(hits) > args.n:
+        print(f"… {len(hits) - args.n} more — narrow the query or `-n {len(hits)}`")
+    print("→ `shelf show <name>` for the full note")
+
+
+def cmd_tags(args):
+    ensure_shelf()
+    items = load()
+    counts: dict = {}
+    for i in items:
+        for t in tags_of(i):
+            counts[t] = counts.get(t, 0) + 1
+    for tag, n in sorted(counts.items(), key=lambda p: (-p[1], p[0])):
+        print(f"{tag:<20} {n}")
+    print(f"{len(items)} items")
+
+
+def filtered(args) -> list:
+    items = load()
+    if getattr(args, "tag", None):
+        items = [i for i in items if args.tag in tags_of(i)]
+    return items
+
+
+def cmd_list(args):
+    ensure_shelf()
+    for i in filtered(args):
+        print(
+            f"{i['name']:<26} {i['verdict'] or 'untried':<10} "
+            f"{','.join(tags_of(i)):<24} {clip(i['why'], 58)}"
+        )
+
+
+def cmd_print(args):
+    ensure_shelf()
+    items = filtered(args)
+    bold, dim, off = ("\033[1m", "\033[2m", "\033[0m") if colour_on() else ("", "", "")
+    groups: dict = {}
+    for i in items:
+        groups.setdefault(i["verdict"] or "untried", []).append(i)
+    print(f"\n{bold}Shelf{off} {dim}— {len(items)} items · {shelf_dir()}{off}\n")
+    for verdict in sorted(groups, key=lambda v: VERDICT_ORDER.get(v, 9)):
+        group = groups[verdict]
+        print(f"{bold}{verdict.upper()}{off} {dim}({len(group)}){off}")
+        for i in group:
+            print(f"  {i['name']:<24} {dim}{','.join(tags_of(i))}{off}")
+            if i["why"]:
+                print(f"  {'':<24}{clip(i['why'], 88)}")
+            print(f"  {dim}{'':<24}{i['url']}{off}")
+        print()
+
+
+def cmd_show(args):
+    ensure_shelf()
+    path = items_dir() / f"{args.slug}.md"
+    if not path.exists():
+        die(f"no such item: {args.slug} — try `shelf find {args.slug}`")
+    print(path.read_text(encoding="utf-8"), end="")
+
+
+def cmd_edit(args):
+    ensure_shelf()
+    path = items_dir() / f"{args.slug}.md"
+    if not path.exists():
+        die(f"no such item: {args.slug}")
+    subprocess.run([os.environ.get("EDITOR", "vi"), str(path)], check=False)
+    render_index()
+
+
+def cmd_verdict(args):
+    ensure_shelf()
+    path = items_dir() / f"{args.slug}.md"
+    if not path.exists():
+        die(f"no such item: {args.slug}")
+    text = path.read_text(encoding="utf-8")
+    if re.search(r"^verdict:.*$", text, re.M):
+        text = re.sub(r"^verdict:.*$", f"verdict: {args.verdict}", text, count=1, flags=re.M)
+    else:
+        text = text.replace("---", f"---\nverdict: {args.verdict}", 1)
+    path.write_text(text, encoding="utf-8")
+    render_index()
+    print(f"{args.slug} → {args.verdict}")
+    print("  say why in the note: shelf edit " + args.slug)
+
+
+def cmd_path(args):
+    print(shelf_dir())
+
+
+def render_index():
+    items = load()
+    out = [
+        "# Shelf",
+        "",
+        "Things that might be useful on a future project.",
+        "Generated by [shelf](https://github.com/jhammant/shelf) — do not edit by hand.",
+        "",
+        "| Item | Why it's here | Tags | Verdict | Added |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for i in items:
+        link = f"[{i['name']}]({i['url']})" if i["url"] else i["name"]
+        why = i["why"].replace("|", "\\|")
+        out.append(
+            f"| {link} · [notes](items/{i['name']}.md) | {why} "
+            f"| {','.join(tags_of(i))} | {i['verdict'] or 'untried'} | {i['added']} |"
+        )
+    out += ["", "_Verdicts: `untried` · `trialling` · `adopted` · `rejected`._"]
+    (shelf_dir() / "README.md").write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def cmd_index(args):
+    ensure_shelf()
+    render_index()
+    print(f"{shelf_dir() / 'README.md'} regenerated")
+
+
+# ---------------------------------------------------------------- cli
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="shelf",
+        description="A context-budgeted store for tools you might use on a future project.",
+        epilog="Data lives in $SHELF_DIR (default ~/.shelf).",
+    )
+    p.add_argument("--version", action="version", version=f"shelf {__version__}")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("init", help="create the shelf directory").set_defaults(fn=cmd_init)
+
+    a = sub.add_parser("add", help="shelve a url")
+    a.add_argument("url")
+    a.add_argument("-w", "--why", default="", help="why it caught your eye")
+    a.add_argument("-t", "--tags", default="", help="comma-separated tags")
+    a.add_argument("-s", "--slug", default="", help="override the derived slug")
+    a.add_argument("-c", "--clone", action="store_true", help="also shallow-clone the repo")
+    a.add_argument("--offline", action="store_true", help="skip GitHub metadata lookup")
+    a.set_defaults(fn=cmd_add)
+
+    f = sub.add_parser("find", help="ranked search, capped (start here)")
+    f.add_argument("query", nargs="+")
+    f.add_argument("-n", type=int, default=DEFAULT_HITS, help=f"max hits (default {DEFAULT_HITS})")
+    f.set_defaults(fn=cmd_find)
+
+    sub.add_parser("tags", help="tag vocabulary and counts").set_defaults(fn=cmd_tags)
+
+    for name, fn, helptext in (
+        ("list", cmd_list, "one terse line per item"),
+        ("print", cmd_print, "browsable view, grouped by verdict"),
+    ):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("tag", nargs="?", default="", help="filter by tag")
+        s.set_defaults(fn=fn)
+
+    for name, fn, helptext in (
+        ("show", cmd_show, "print one full note"),
+        ("edit", cmd_edit, "open a note in $EDITOR"),
+        ("clone", cmd_clone, "shallow-clone a shelved repo"),
+    ):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("slug")
+        s.set_defaults(fn=fn)
+
+    v = sub.add_parser("verdict", help="set untried/trialling/adopted/rejected")
+    v.add_argument("slug")
+    v.add_argument("verdict", choices=VERDICTS)
+    v.set_defaults(fn=cmd_verdict)
+
+    sub.add_parser("index", help="regenerate the shelf README").set_defaults(fn=cmd_index)
+    sub.add_parser("path", help="print the shelf directory").set_defaults(fn=cmd_path)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "fn", None):
+        parser.print_help()
+        return 0
+    args.fn(args)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
