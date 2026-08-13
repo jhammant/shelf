@@ -16,12 +16,12 @@ dump. Measured at 100 items:
 
 | Command | Cost | Scales with shelf size? | Use |
 | --- | --- | --- | --- |
-| `shelf find <q>` | ~290 tok | **no** — capped at 8 hits | entry point, always |
-| `shelf tags` | ~90 tok | no | when a search misses |
-| `shelf show <slug>` | ~650 tok | no | after find, 1–2 notes max |
-| `shelf list` | ~3,000 tok | **yes, linear** | human terminal only |
-| `shelf print` | ~5,000 tok | **yes, linear** | human terminal only |
-| every note | ~65,000 tok | — | never |
+| `shelf find <q>` | ~220 tok | **no** — capped at 8 hits | entry point, always |
+| `shelf tags` | ~240 tok | no | when a search misses |
+| `shelf show <slug>` | ~530 tok | no | after find, 1–2 notes max |
+| `shelf list` | ~2,500 tok | **yes, linear** | human terminal only |
+| `shelf print` | ~3,800 tok | **yes, linear** | human terminal only |
+| every note | ~53,000 tok | — | never |
 
 Hard rules:
 

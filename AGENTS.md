@@ -19,11 +19,11 @@ Retrieval is two steps and bounded, because this output lands in your context wi
 
 | Command | Cost @100 items | Scales? | Use |
 | --- | --- | --- | --- |
-| `shelf find <q>` | ~290 tok | no, capped at 8 | always start here |
-| `shelf tags` | ~90 tok | no | when a search misses |
-| `shelf show <slug>` | ~650 tok | no | after find, 1–2 max |
-| `shelf list` / `print` | 3–5k tok | **yes, linear** | human terminal only — not you |
-| every note | ~65,000 tok | — | never |
+| `shelf find <q>` | ~220 tok | no, capped at 8 | always start here |
+| `shelf tags` | ~240 tok | no | when a search misses |
+| `shelf show <slug>` | ~530 tok | no | after find, 1–2 max |
+| `shelf list` / `print` | 2.5–4k tok | **yes, linear** | human terminal only — not you |
+| every note | ~53,000 tok | — | never |
 
 Rules:
 
