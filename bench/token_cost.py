@@ -5,6 +5,10 @@ This is the benchmark behind the cost table in the README. It builds throwaway
 shelves of 10 / 100 / 500 items whose notes match the length of real filled-in
 ones (~2.5KB), then counts tokens on every command path.
 
+The shelves are deliberately mixed — ~20% `reading` items, and a constraint set
+that the generated verdicts cite — so the `find` row is measured on
+constraint-bearing, two-vocabulary data rather than the easy case.
+
     pip install tiktoken
     ./bench/token_cost.py
 
@@ -41,13 +45,25 @@ TOPICS = [("rate-limiting", "token bucket limiter"), ("workflow", "durable execu
           ("db", "embedded analytical database"), ("http", "async http framework"),
           ("validation", "schema and coercion layer"), ("scheduling", "cron with backfill"),
           ("metrics", "cardinality-bounded metrics"), ("logs", "structured log shipper")]
+# Three of these six are now constraints rather than prose — which is the whole
+# point of the feature. The blocker text stays for the notes that are not cited.
 BLOCKERS = ["Needs Redis and we are deliberately single-node",
             "License flipped to BSL in the last release, so it is out for anything we ship",
             "Last push was 14 months ago with 200 open issues and no triage",
             "Pulls 60MB of transitive deps for a feature we would use 5% of",
             "Only supports Postgres 15+ and we are pinned to 13 until Q3",
             "Maintainer has publicly asked for someone to take it over"]
-VERDICTS = ["untried", "trialling", "adopted", "rejected"]
+TOOL_VERDICTS = ["untried", "trialling", "adopted", "rejected"]
+READING_VERDICTS = ["unread", "useful", "noise"]
+CONSTRAINTS = [("single-node", "no Redis, no Kafka — one box and no cluster ops"),
+               ("pg13", "pinned to Postgres 13 until Q3"),
+               ("no-bsl", "BSL/SSPL is out for anything we ship"),
+               ("arm64", "builds must run on Apple silicon and Graviton"),
+               ("py38", "library code has to import on Python 3.8"),
+               ("no-jvm", "nothing that needs a JVM on the build boxes"),
+               ("one-binary", "operational story has to be one binary and one config file"),
+               ("no-k8s", "we do not run Kubernetes and are not going to")]
+READING_HOSTS = ["example.com/blog", "arxiv.org/abs", "martinfowler.com/articles"]
 
 # A note written the way the README tells you to write one.
 BODY = """## What it is
@@ -88,24 +104,67 @@ project goes unmaintained is that we keep running the last good binary rather th
 scrambling to replace it.
 """
 
+# The reading counterpart, written the way the README tells you to write one.
+READING_BODY = """## What it argues
+
+That {topic} is mostly an organisational problem wearing an engineering costume, and
+that the {what} everyone reaches for is treating the symptom. The argument runs through
+three case studies and one long postmortem, and the load-bearing claim is that the
+coordination cost grows faster than the thing being coordinated.
+
+## What I took from it
+
+The framing that a {topic} system is a queue with opinions, which is a better mental
+model than the one I had. Also the observation that {store} is almost always the real
+bottleneck and everything upstream of it is theatre — that matches what we saw in the
+{proj} project when the hand-rolled version finally fell over.
+
+## What I'd push back on
+
+The case studies are all at a scale we will never see, and the postmortem quietly
+assumes a team of eight. At our size the coordination cost the author is worried about
+is a Slack message. {blocker} — which the piece never engages with, because at its
+scale that constraint does not exist.
+
+## Where I'd apply it
+
+The {proj} project, when we next argue about {topic}. Specifically the queue-with-
+opinions framing, which would have saved us a week of design meetings, and the
+measurement approach in the appendix, which is cheap enough to just do. Not the
+architecture — that is for a team three times our size, and adopting it wholesale is
+exactly the mistake the author warns about in the conclusion.
+"""
+
 
 def build(root, n):
     """Create a shelf of n items and return its env."""
-    env = dict(os.environ, SHELF_DIR=root)
+    # SHELF_NO_LOG keeps the benchmark hermetic: no usage log, no compaction, and the
+    # measured commands stay identical to a clean-room run.
+    env = dict(os.environ, SHELF_DIR=root, SHELF_NO_LOG="1")
     run = lambda *a: subprocess.run([SHELF, *a], env=env, check=True, capture_output=True)
     run("init")
     random.seed(7)
+    for cid, text in CONSTRAINTS:
+        run("constraint", cid, text)
     for i in range(n):
         topic, what = TOPICS[i % len(TOPICS)]
         org = ORGS[i % len(ORGS)]
+        reading = i % 5 == 0                      # ~20% of a real shelf is reading
         name = f"{topic.replace('-', '')}{i:03d}"
         why = (f"{what} — {random.choice(['zero deps', 'tiny API', 'benchmarks well', 'good docs'])}"
                f", worth a look for {topic}")
-        run("add", f"https://github.com/{org}/{name}", "-w", why, "-t", f"{topic},{org}", "--offline")
-        run("verdict", name, random.choice(VERDICTS))
+        url = (f"https://{READING_HOSTS[i % len(READING_HOSTS)]}/{name}" if reading
+               else f"https://github.com/{org}/{name}")
+        run("add", url, "-w", why, "-t", f"{topic},{org}", "-s", name, "--offline")
+        verdict = random.choice(READING_VERDICTS if reading else TOOL_VERDICTS)
+        # A negative verdict is the one that usually rests on a standing fact.
+        because = ([random.choice(CONSTRAINTS)[0]] if verdict in ("rejected", "noise")
+                   else [])
+        run("verdict", name, verdict, *(["--because", ",".join(because)] if because else []))
         note = pathlib.Path(root) / "items" / f"{name}.md"
-        front, _, _ = note.read_text().partition("## What it is")
-        note.write_text(front + BODY.format(
+        heading = "## What it argues" if reading else "## What it is"
+        front, _, _ = note.read_text().partition(heading)
+        note.write_text(front + (READING_BODY if reading else BODY).format(
             what=what.capitalize(),
             size=random.choice(["3k lines", "8k lines", "22k lines"]),
             store=random.choice(["SQLite", "Redis", "Postgres", "the filesystem"]),
@@ -116,17 +175,31 @@ def build(root, n):
 
 
 def measure(root, env):
-    out = lambda *a: subprocess.run([SHELF, *a], env=env, capture_output=True, text=True).stdout
+    out = lambda *a, **kw: subprocess.run(
+        [SHELF, *a], env=kw.get("env", env), capture_output=True, text=True).stdout
     toks = lambda s: len(ENC.encode(s))
     notes = sorted((pathlib.Path(root) / "items").glob("*.md"))
     find, show = toks(out("find", "rate-limiting")), toks(out("show", notes[0].stem))
+    cited = [l.split()[0] for l in out("constraints").splitlines() if "\u00d7" in l]
+
+    # `stats` reports on a usage log, so it needs one. Generate it deliberately with a
+    # second env — every other row above is measured with logging off, hermetically.
+    logged = {k: v for k, v in env.items() if k != "SHELF_NO_LOG"}
+    for note in notes[:20]:
+        out("find", note.stem, env=logged)
+        out("show", note.stem, env=logged)
+    out("find", "kubernetes", env=logged)
+
     return {
+        "constraints": toks(out("constraints")),
         "find <q>": find,
+        "revisit <id>": toks(out("revisit", cited[0])) if cited else 0,
         "tags": toks(out("tags")),
         "show <slug>": show,
         "find + show": find + show,
         "list": toks(out("list")),
         "print": toks(out("print")),
+        "stats": toks(out("stats", env=logged)),
         "every note": sum(toks(p.read_text()) for p in notes),
     }
 

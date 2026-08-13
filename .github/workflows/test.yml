@@ -9,3 +9,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./tests/test_shelf.sh
+
+  # The README promises Python 3.8+, and stdlib behaviour differs there in ways
+  # `ast.parse(feature_version=(3, 8))` cannot see — argparse's handling of a
+  # string default on a nargs='?' positional, for one. So run the real suite on
+  # the oldest supported interpreter.
+  oldest-python:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - run: python3 -V
+      - run: ./tests/test_shelf.sh

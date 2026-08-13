@@ -2,7 +2,8 @@
 """shelf — a context-budgeted store for tools you might use on a future project.
 
 Notes live in $SHELF_DIR/items/*.md as markdown with YAML-ish frontmatter. Optional
-shallow clones live in $SHELF_DIR/repos/ and are gitignored.
+shallow clones live in $SHELF_DIR/repos/ and are gitignored. The standing facts that
+decide things for you live in $SHELF_DIR/constraints.md — one small file, loaded whole.
 
 The design constraint is that this output usually lands in an AI agent's context
 window, so `find` is ranked and hard-capped while the browsable views are kept
@@ -24,13 +25,44 @@ import sys
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-FIELDS = ("name", "url", "tags", "added", "verdict", "stars", "license", "pushed", "desc", "why")
-VERDICTS = ("untried", "trialling", "adopted", "rejected")
-VERDICT_ORDER = {v: i for i, v in enumerate(("adopted", "trialling", "untried", "rejected"))}
+FIELDS = ("name", "kind", "url", "tags", "added", "verdict", "because",
+          "stars", "license", "pushed", "desc", "why")
+KINDS = ("tool", "reading")
+KIND_LABEL = {"tool": "TOOLS", "reading": "READING"}
+KIND_TITLE = {"tool": "Tools", "reading": "Reading"}
+TOOL_VERDICTS = ("untried", "trialling", "adopted", "rejected")
+READING_VERDICTS = ("unread", "useful", "noise")     # disjoint from the above — load-bearing
+VERDICTS = TOOL_VERDICTS + READING_VERDICTS          # argparse choices; name kept
+VERDICTS_BY_KIND = {"tool": TOOL_VERDICTS, "reading": READING_VERDICTS}
+DEFAULT_VERDICT = {"tool": "untried", "reading": "unread"}
+VERDICT_ORDER = {v: i for i, v in enumerate(
+    ("adopted", "trialling", "untried", "rejected",   # tool: positive → parked → negative
+     "useful", "unread", "noise"))}                   # reading: same shape
 WHY_CAP = 110
-DEFAULT_HITS = 8
+DEFAULT_HITS = 8                                      # unchanged — the cap is the product
+CONSTRAINT_CAP = 80                                   # display clip, the WHY_CAP analogue
+CONSTRAINT_SOFT_MAX = 12                              # past this it is not a constraint list
+CID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,23}$")   # 24 chars keeps `find` budget-neutral
+
+# The verdict codes in the usage log. Two vocabularies means first letters collide
+# (untried/unread/useful), so the map is explicit and asserted bijective in the tests.
+VERDICT_CODE = {"untried": "u", "trialling": "t", "adopted": "a", "rejected": "r",
+                "unread": "ur", "useful": "uf", "noise": "no"}
+LETTER_VERDICT = {c: v for v, c in VERDICT_CODE.items()}
+
+LOG_NAME = "log.jsonl"
+LOG_IGNORE = "log.*"      # covers log.jsonl AND the log.tmp compaction scratch file
+LOG_OFF_NAME = ".nolog"
+LOG_MAX_BYTES = 262_144   # compaction trigger — about 1,300 events
+LOG_KEEP_BYTES = 65_536   # raw events kept after compaction (byte-based: can't thrash)
+LOG_TOP_MISSES = 40       # missed queries carried forward in a rollup
+LOG_TOP_ITEMS = 400       # retrieved items carried forward in a rollup — without this the
+                          # record grows with the shelf and LOG_MAX_BYTES stops being a cap
+LOG_Q_CAP = 120           # chars of query text recorded
+STATS_TOP = 8             # rows per section in the report
+DEAD_GRACE_DAYS = 30      # an item is only dead weight once it has had a fair chance
 
 TEMPLATE = """
 ## What it is
@@ -41,6 +73,35 @@ TEMPLATE = """
 
 ## If I trial it
 """
+
+READING_TEMPLATE = """
+## What it argues
+
+## What I took from it
+
+## What I'd push back on
+
+## Where I'd apply it
+"""
+
+TEMPLATES = {"tool": TEMPLATE, "reading": READING_TEMPLATE}
+
+CONSTRAINTS_HEADER = """# Constraints
+
+Standing facts about this setup that decide things for you. Verdicts cite them by
+id (`shelf verdict <slug> rejected --because <id>`), so when one changes,
+`shelf revisit <id>` finds every decision that rested on it.
+
+Keep this short — one screen, ~10 constraints. It is loaded whole, every session.
+Bullets of the form "- id: text" are parsed as constraints; write prose as prose.
+
+"""
+
+CONSTRAINT_RE = re.compile(
+    r"^\s*[-*]\s+`?(?P<id>[A-Za-z0-9][A-Za-z0-9._-]*)`?\s*:\s*(?P<rest>\S.*?)\s*$")
+META_RE = re.compile(
+    r"\s*\((?:since (?P<since>\d{4}-\d{2}-\d{2}))?"
+    r"(?:(?:, )?lifted (?P<lifted>\d{4}-\d{2}-\d{2}))?\)$")
 
 
 # ---------------------------------------------------------------- paths & io
@@ -55,6 +116,10 @@ def items_dir() -> pathlib.Path:
 
 def repos_dir() -> pathlib.Path:
     return shelf_dir() / "repos"
+
+
+def constraints_path() -> pathlib.Path:
+    return shelf_dir() / "constraints.md"
 
 
 def die(msg: str, code: int = 1):
@@ -81,6 +146,33 @@ def slugify(value: str) -> str:
     return value.strip("-") or "item"
 
 
+TOOL_HOSTS = ("github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "sr.ht",
+              "pypi.org", "npmjs.com", "crates.io", "rubygems.org", "pkg.go.dev",
+              "hub.docker.com")
+READING_HOSTS = ("arxiv.org", "medium.com", "substack.com", "dev.to", "youtube.com",
+                 "youtu.be", "lobste.rs", "news.ycombinator.com", "ghost.io",
+                 "hashnode.dev", "wordpress.com", "wikipedia.org")
+READING_PATHS = ("/blog/", "/posts/", "/post/", "/article", "/writing/", "/talks/",
+                 "/papers/", "/paper/", "/newsletter/", "/wiki/", "/abs/")
+
+
+def infer_kind(url: str) -> str:
+    """Guess reading vs tool from the url. Only ever promotes to `reading` on positive
+    evidence — anything unrecognised stays `tool`, which is what every note written
+    before this field existed already is."""
+    u = url.strip().lower()
+    m = re.match(r"^(?:https?://)?(?:www\.)?([^/?#]*)(.*)$", u)
+    host, path = (m.group(1).split(":")[0], m.group(2)) if m else (u, "")
+    hit = lambda hosts: any(host == h or host.endswith("." + h) for h in hosts)
+    if hit(TOOL_HOSTS) or path.endswith(".git"):
+        return "tool"                       # forge/registry wins over any path signal
+    if hit(READING_HOSTS) or host.startswith("blog."):
+        return "reading"
+    if any(s in path for s in READING_PATHS) or path.endswith(".pdf"):
+        return "reading"
+    return "tool"
+
+
 def parse(path: pathlib.Path) -> dict:
     text = path.read_text(encoding="utf-8")
     item = {k: "" for k in FIELDS}
@@ -99,7 +191,7 @@ def parse(path: pathlib.Path) -> dict:
                 value = json.loads(value)
             except json.JSONDecodeError:
                 pass
-        item[key] = value.strip("[]") if key == "tags" else value
+        item[key] = value.strip("[]") if key in ("tags", "because") else value
     item["body"] = body
     return item
 
@@ -109,8 +201,27 @@ def load() -> list:
     return sorted(items, key=lambda i: i.get("added", ""), reverse=True)
 
 
+def split_csv(value: str) -> list:
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
 def tags_of(item: dict) -> list:
-    return [t.strip() for t in item["tags"].split(",") if t.strip()]
+    return split_csv(item["tags"])
+
+
+def because_of(item: dict) -> list:
+    return split_csv(item.get("because") or "")
+
+
+def kind_of(item: dict) -> str:
+    """Absent or unrecognised → tool. Every pre-kind note on disk is a tool."""
+    k = (item.get("kind") or "").strip().lower()
+    return k if k in KINDS else "tool"
+
+
+def verdict_of(item: dict) -> str:
+    """Never coerces a cross-kind verdict — only fills in the default when blank."""
+    return (item.get("verdict") or "").strip() or DEFAULT_VERDICT[kind_of(item)]
 
 
 def clip(text: str, cap: int = WHY_CAP) -> str:
@@ -150,8 +261,8 @@ def write_item(slug: str, fields: dict, body: str = TEMPLATE) -> pathlib.Path:
         value = fields.get(key, "")
         if not value:
             continue
-        if key == "tags":
-            lines.append(f"tags: [{value}]")
+        if key in ("tags", "because"):
+            lines.append(f"{key}: [{value}]")
         elif key in ("why", "desc"):
             lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
         else:
@@ -162,6 +273,299 @@ def write_item(slug: str, fields: dict, body: str = TEMPLATE) -> pathlib.Path:
     return path
 
 
+def upsert_field(text: str, key: str, value: str) -> str:
+    """Set, replace or (empty value) delete one frontmatter field. Only ever touches
+    the frontmatter slice, so a body line starting `verdict:` cannot be clobbered.
+    A missing field is inserted in FIELDS order, not appended."""
+    if not text.startswith("---"):
+        return f"---\n{key}: {value}\n---\n{text}" if value else text
+    end = text.find("\n---", 3)
+    if end < 0:
+        end = len(text)
+    head, rest = text[:end], text[end:]
+    pat = re.compile(r"^%s:.*$" % re.escape(key), re.M)
+    if pat.search(head):
+        if value:
+            head = pat.sub(lambda _: f"{key}: {value}", head, count=1)
+        else:
+            head = re.sub(r"\n\n+", "\n", pat.sub("", head, count=1))
+    elif value:
+        lines = head.split("\n")
+        rank = FIELDS.index(key) if key in FIELDS else len(FIELDS)
+        at = len(lines)
+        for n, line in enumerate(lines):
+            k = line.partition(":")[0].strip()
+            if k in FIELDS and FIELDS.index(k) > rank:
+                at = n
+                break
+        lines.insert(at, f"{key}: {value}")
+        head = "\n".join(lines)
+    return head + rest
+
+
+# ---------------------------------------------------------------- constraints
+# The small thing. Bounded by the user's reality, not by shelf size, so it gets the
+# opposite treatment to items: always loaded, never searched.
+
+def parse_constraint(line: str):
+    """`- \\`id\\`: text  (since YYYY-MM-DD, lifted YYYY-MM-DD)` → dict, else None.
+    Forgiving on read — a hand-typed `- pg13: pinned to 13` parses fine — because
+    hand-editing the file has to stay safe."""
+    m = CONSTRAINT_RE.match(line)
+    if not m:
+        return None
+    rest, since, lifted = m.group("rest"), "", ""
+    meta = META_RE.search(rest)
+    if meta and (meta.group("since") or meta.group("lifted")):
+        since, lifted = meta.group("since") or "", meta.group("lifted") or ""
+        rest = rest[: meta.start()].rstrip()
+    return {"id": m.group("id"), "text": rest, "since": since, "lifted": lifted}
+
+
+def fmt_constraint(c: dict) -> str:
+    """Exact inverse of parse_constraint. Backticks always written, never required."""
+    meta = []
+    if c.get("since"):
+        meta.append("since " + c["since"])
+    if c.get("lifted"):
+        meta.append("lifted " + c["lifted"])
+    tail = "  ({})".format(", ".join(meta)) if meta else ""
+    return "- `{}`: {}{}".format(c["id"], c["text"], tail)
+
+
+def load_constraints() -> list:
+    """File order preserved. A missing file returns [] — that IS the v0.1 upgrade path."""
+    path = constraints_path()
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        c = parse_constraint(line)
+        if c:
+            out.append(c)
+    return out
+
+
+def edit_constraint(cid: str, text=None, lift=False, drop=False) -> dict:
+    """Line-surgical: prose, headers and hand-written formatting survive untouched."""
+    path = constraints_path()
+    lines = (path.read_text(encoding="utf-8").splitlines() if path.exists()
+             else CONSTRAINTS_HEADER.splitlines())
+    found, last = None, -1
+    for n, line in enumerate(lines):
+        c = parse_constraint(line)
+        if not c:
+            continue
+        last = n
+        if c["id"] == cid:
+            found = (n, c)
+    if found is None:
+        c = {"id": cid, "text": text or "", "created": True,
+             "since": datetime.date.today().isoformat(), "lifted": ""}
+        lines.insert(last + 1 if last >= 0 else len(lines), fmt_constraint(c))
+    else:
+        n, c = found
+        c["created"] = False
+        if drop:
+            del lines[n]
+        else:
+            if text is not None:
+                c["text"] = text
+            if lift:
+                c["lifted"] = datetime.date.today().isoformat()
+            lines[n] = fmt_constraint(c)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return c
+
+
+def citations() -> dict:
+    """cid → [item, …]. One load() pass feeds the ×N counts, revisit and orphan detection."""
+    out: dict = {}
+    for item in load():
+        for cid in because_of(item):
+            out.setdefault(cid, []).append(item)
+    return out
+
+
+def die_unknown_constraint(cid: str, known):
+    die(f"unknown constraint: {cid}\n"
+        f"  known: {', '.join(known) if known else '(none yet)'}\n"
+        f'  add it:  shelf constraint {cid} "<the standing fact>"')
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def churn_sorted(items: list) -> list:
+    """Most-likely-to-change first: VERDICT_ORDER negated, so rejected leads adopted."""
+    return sorted(items, key=lambda i: (-VERDICT_ORDER.get(verdict_of(i), -1), i["name"]))
+
+
+# ---------------------------------------------------------------- telemetry
+# A local, opt-out usage log so you can see whether the shelf is earning its keep.
+# Two rules: it never adds a byte to `find`/`show` output, and it never raises.
+# If anything goes wrong we lose telemetry, not the tool.
+
+def log_path() -> pathlib.Path:
+    return shelf_dir() / LOG_NAME
+
+
+def logging_off() -> bool:
+    return bool(os.environ.get("SHELF_NO_LOG")) or (shelf_dir() / LOG_OFF_NAME).exists()
+
+
+def ignore_log_in_git():
+    """The shelf is a git repo and people sync it. Queries stay on this machine — and
+    that means the compaction scratch file too, which holds the same verbatim query
+    text and survives an interrupted rewrite. One pattern covers both."""
+    gitignore = shelf_dir() / ".gitignore"
+    text = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if LOG_IGNORE in text.split():
+        return
+    with open(gitignore, "a", encoding="utf-8") as fh:
+        fh.write(("" if not text or text.endswith("\n") else "\n") + LOG_IGNORE + "\n")
+
+
+def log_event(op: str, **fields):
+    """Append one JSONL record. Silent and best-effort: a read-only shelf, a full
+    disk or a hostile filesystem costs you stats, never a search."""
+    if logging_off():
+        return
+    try:
+        path = log_path()
+        if not path.exists():
+            ignore_log_in_git()
+        elif path.stat().st_size > LOG_MAX_BYTES:
+            compact_log()
+        record = {"t": datetime.datetime.now().isoformat(timespec="seconds"), "op": op}
+        record.update(fields)
+        blob = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, blob)  # one write() under O_APPEND — whole records, no interleaving
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001 — telemetry must never break retrieval
+        pass
+
+
+def hit_code(item: dict) -> str:
+    """`slug:code` — the verdict as it was when surfaced, not as it is now."""
+    return f"{item['name']}:{VERDICT_CODE.get(verdict_of(item), 'u')}"
+
+
+def new_stats() -> dict:
+    return {"since": "", "to": "", "finds": 0, "misses": 0, "shows": 0, "piped": 0,
+            "missed": {}, "surfaced": {}, "opened": {}, "items": {}}
+
+
+def bump(counts: dict, key: str, n: int = 1):
+    counts[key] = counts.get(key, 0) + n
+
+
+def fold(acc: dict, rec: dict):
+    """Fold one record into an accumulator. Shared by `stats` and compaction, so a
+    compacted shelf and a fresh one can never disagree about what a number means."""
+    stamp = rec.get("t") or rec.get("since")
+    if stamp:
+        acc["since"] = min(acc["since"], stamp) if acc["since"] else stamp
+        acc["to"] = max(acc["to"], rec.get("to") or rec.get("t") or "")
+    op = rec.get("op")
+    if op == "find":
+        acc["finds"] += 1
+        acc["piped"] += 0 if rec.get("tty") else 1
+        hits = rec.get("hits") or []
+        if not hits:
+            acc["misses"] += 1
+            bump(acc["missed"], rec.get("q", ""))
+        for code in hits:
+            slug, _, letter = code.rpartition(":")
+            acc["items"].setdefault(slug, [0, 0])[0] += 1
+            bump(acc["surfaced"], LETTER_VERDICT.get(letter, "untried"))
+    elif op == "show":
+        acc["shows"] += 1
+        acc["piped"] += 0 if rec.get("tty") else 1
+        acc["items"].setdefault(rec.get("slug", ""), [0, 0])[1] += 1
+        bump(acc["opened"], LETTER_VERDICT.get(rec.get("v", ""), "untried"))
+    elif op == "rollup":
+        for key in ("finds", "misses", "shows", "piped"):
+            acc[key] += rec.get(key, 0)
+        for key in ("missed", "surfaced", "opened"):
+            for name, n in (rec.get(key) or {}).items():
+                bump(acc[key], name, n)
+        for slug, pair in (rec.get("items") or {}).items():
+            entry = acc["items"].setdefault(slug, [0, 0])
+            entry[0] += pair[0]
+            entry[1] += pair[1]
+
+
+def read_log() -> list:
+    """Every parseable record, oldest first. A half-written line is skipped, not fatal."""
+    try:
+        text = log_path().read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("op"):
+            out.append(rec)
+    return out
+
+
+def compact_log():
+    """Fold everything but a recent tail into one rollup record, so lifetime counters
+    survive truncation instead of silently resetting. ~4ms, once per ~1,300 events.
+    Not an atomic append (tmp + os.replace), so a concurrent find can lose at most
+    one record — telemetry only, and cheaper than taking a lock on the hot path.
+
+    Every carried-forward map is capped, because a rollup that grows with the shelf
+    would push the record past LOG_MAX_BYTES and make every later find recompact a
+    log it can no longer shrink. The scalar counters are exact; the per-item map
+    keeps the top LOG_TOP_ITEMS by retrieval count, so anything in real use survives
+    and a once-retrieved item on a huge shelf may fall back to `never retrieved`."""
+    recs = read_log()
+    events = [r for r in recs if r.get("op") != "rollup"]
+    dumps = lambda r: json.dumps(r, ensure_ascii=False, separators=(",", ":"))
+    keep, budget = [], LOG_KEEP_BYTES
+    for rec in reversed(events):
+        line = dumps(rec)
+        budget -= len(line) + 1
+        if budget < 0:
+            break
+        keep.append(line)
+    keep.reverse()
+    acc = new_stats()
+    for rec in recs[: len(recs) - len(keep)]:
+        fold(acc, rec)
+    live = {p.stem for p in items_dir().glob("*.md")}
+    kept_items = sorted(((k, v) for k, v in acc["items"].items() if k in live),
+                        key=lambda p: (-(p[1][0] + p[1][1]), p[0]))
+    acc["items"] = dict(kept_items[:LOG_TOP_ITEMS])
+    acc["missed"] = dict(sorted(acc["missed"].items(), key=lambda p: -p[1])[:LOG_TOP_MISSES])
+    acc["op"] = "rollup"
+    ignore_log_in_git()  # the tmp below holds query text; make sure git is told first
+    tmp = log_path().with_suffix(".tmp")
+    blob = ("\n".join([dumps(acc)] + keep) + "\n").encode("utf-8")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, blob)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(log_path()))
+    except Exception:
+        try:
+            tmp.unlink()  # a half-written tmp is verbatim query history, left behind
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_init(args):
@@ -169,12 +573,17 @@ def cmd_init(args):
         d.mkdir(parents=True, exist_ok=True)
     gitignore = shelf_dir() / ".gitignore"
     if not gitignore.exists():
-        gitignore.write_text("repos/\n", encoding="utf-8")
+        gitignore.write_text(f"repos/\n{LOG_IGNORE}\n", encoding="utf-8")
+    if not constraints_path().exists():
+        constraints_path().write_text(CONSTRAINTS_HEADER, encoding="utf-8")
     if not (shelf_dir() / ".git").exists() and shutil.which("git"):
         subprocess.run(["git", "init", "-q"], cwd=shelf_dir(), check=False)
     render_index()
     print(f"shelf ready at {shelf_dir()}")
     print("  add your first item:  shelf add <url> -w \"why it caught your eye\" -t tag")
+    print("  record a standing fact:  shelf constraint single-node \"no Redis, one box\"")
+    print(f"  find/show are logged to {LOG_NAME} (local, gitignored) — `shelf stats`, "
+          "`shelf stats --off`")
 
 
 def cmd_add(args):
@@ -183,21 +592,23 @@ def cmd_add(args):
     path = items_dir() / f"{slug}.md"
     if path.exists():
         die(f"already shelved: {path}\n  edit it with `shelf edit {slug}`")
+    kind = args.kind or infer_kind(args.url)
     fields = {
         "name": slug,
+        "kind": kind,
         "url": args.url,
         "tags": ",".join(t.strip() for t in args.tags.split(",") if t.strip()) if args.tags else "",
         "added": datetime.date.today().isoformat(),
-        "verdict": "untried",
+        "verdict": DEFAULT_VERDICT[kind],
         "why": args.why or "",
     }
     if not args.offline:
         fields.update(gh_meta(args.url))
-    write_item(slug, fields)
+    write_item(slug, fields, TEMPLATES[kind])
     if args.clone:
         clone_repo(slug)
     render_index()
-    print(f"shelved → {path}")
+    print(f"shelved → {path}  ({kind})")
     print(f"  now fill in the note: shelf edit {slug}")
 
 
@@ -236,24 +647,158 @@ def score(item: dict, terms: list) -> int:
     return total
 
 
+def emit_hits(items: list, n: int, more_hint: str, tail: str, hide=()) -> list:
+    """The one bounded renderer, shared by find / revisit / --lift so the cap and the
+    line format cannot drift. A cited item spends its constraint ids INSIDE the same
+    WHY_CAP allowance as the why text, so the line count and the character ceiling are
+    identical cited or not. That is a ceiling, not a free lunch: the ids only displace
+    prose once the why is at the cap. On a why shorter than that they are an addition —
+    measured at ~3 tokens per cited hit, ~24 over a full 8-hit page."""
+    shown = items[:n]
+    for i in shown:
+        print(f"{i['name']}  [{verdict_of(i)}]  {i['url']}")
+        ids = [c for c in because_of(i) if c not in hide]
+        tag = " ".join(ids[:2]) + (f" +{len(ids) - 2}" if len(ids) > 2 else "")
+        if i["why"] or tag:
+            body = clip(i["why"], max(WHY_CAP - len(tag) - 3, 24)) if tag else clip(i["why"])
+            print(f"    {tag} · {body}" if tag else f"    {body}")
+    if len(items) > n:
+        print(f"… {len(items) - n} more — {more_hint}")
+    print(tail)
+    return shown
+
+
 def cmd_find(args):
     ensure_shelf()
-    items = load()
+    items = [i for i in load() if not args.kind or kind_of(i) == args.kind]
     terms = [t for t in args.query if t.strip()]
     hits = sorted(
         [(score(i, terms), i) for i in items if score(i, terms) > 0], key=lambda p: -p[0]
     )
+    shown = []
     if not hits:
         print(f"nothing shelved matches: {' '.join(terms)}")
         print(f"({len(items)} items on the shelf — `shelf tags` for the vocabulary)")
+    else:
+        shown = emit_hits([i for _, i in hits], args.n,
+                          f"narrow the query or `-n {len(hits)}`",
+                          "→ `shelf show <name>` for the full note")
+    log_event("find", q=clip(" ".join(terms), LOG_Q_CAP), n=len(hits), tty=int(sys.stdout.isatty()),
+              hits=[hit_code(i) for i in shown[:DEFAULT_HITS]])
+
+
+def cmd_revisit(args):
+    """Every decision resting on one constraint — same cap, same renderer as find."""
+    ensure_shelf()
+    known = {c["id"]: c for c in load_constraints()}
+    if args.id not in known:
+        die_unknown_constraint(args.id, known)
+    text = clip(known[args.id]["text"], CONSTRAINT_CAP)
+    hits = churn_sorted(citations().get(args.id, []))
+    if not hits:
+        print(f"nothing cites `{args.id}` yet — {text}")
         return
-    for _, i in hits[: args.n]:
-        print(f"{i['name']}  [{i['verdict'] or 'untried'}]  {i['url']}")
-        if i["why"]:
-            print(f"    {clip(i['why'])}")
-    if len(hits) > args.n:
-        print(f"… {len(hits) - args.n} more — narrow the query or `-n {len(hits)}`")
-    print("→ `shelf show <name>` for the full note")
+    verb = "rests" if len(hits) == 1 else "rest"
+    print(f"{plural(len(hits), 'decision')} {verb} on `{args.id}` — {text}")
+    emit_hits(hits, args.n, f"`shelf revisit {args.id} -n {len(hits)}`",
+              "→ `shelf show <name>` before re-deciding", hide={args.id})
+
+
+def cmd_constraints(args):
+    """The always-loaded view: run once a session and keep it. O(1) in shelf size."""
+    ensure_shelf()
+    cons = load_constraints()
+    cites = citations()
+    dim, off = ("\033[2m", "\033[0m") if colour_on() else ("", "")
+    live = [c for c in cons if not c["lifted"]]
+    shown = [c for c in cons if not c["lifted"] or cites.get(c["id"])]
+    if not shown:
+        print("no constraints yet")
+        print('  add one:  shelf constraint single-node "no Redis, no Kafka — one box"')
+    else:
+        for c in shown:
+            n = len(cites.get(c["id"], ()))
+            count = f"×{n}" if n else ""
+            text = clip(c["text"], CONSTRAINT_CAP)
+            if c["lifted"]:
+                text = f"{dim}lifted {c['lifted']} — was: {text}{off}"
+            print(f"{c['id']:<14} {dim}{count:<3}{off} {text}")
+        tail = [f"{len(live)} live"]
+        for c in shown:
+            if not c["lifted"]:
+                continue
+            n = len(cites.get(c["id"], ()))
+            tail.append(f"{c['id']} lifted with {plural(n, 'decision')} "
+                        f"still on it — `shelf revisit {c['id']}`")
+        print(f"{dim}{' · '.join(tail)}{off}")
+    orphans = [cid for cid in sorted(cites) if cid not in {c["id"] for c in cons}]
+    if orphans:
+        n = len({i["name"] for cid in orphans for i in cites[cid]})
+        print(f"! {plural(n, 'item')} cite unknown constraints: {', '.join(orphans[:5])}",
+              file=sys.stderr)
+    if len(live) > CONSTRAINT_SOFT_MAX:
+        print(f"! {len(live)} live constraints — over {CONSTRAINT_SOFT_MAX} this is a wiki, "
+              "not a constraint set; it is loaded every session", file=sys.stderr)
+
+
+def cmd_constraint(args):
+    ensure_shelf()
+    cid = args.id
+    cons = {c["id"]: c for c in load_constraints()}
+    cites = citations()
+    n = len(cites.get(cid, ()))
+
+    if args.drop:
+        if cid not in cons:
+            die_unknown_constraint(cid, cons)
+        if n and not args.force:
+            die(f"refusing: {plural(n, 'item')} cite `{cid}`\n"
+                f"  lift it instead:  shelf constraint {cid} --lift\n"
+                f"  or force:         shelf constraint {cid} --drop --force")
+        edit_constraint(cid, drop=True)
+        render_index()
+        print(f"dropped `{cid}`"
+              + (f" — {plural(n, 'item')} still cite it (`shelf constraints`)" if n else ""))
+        return
+
+    if args.lift:
+        if cid not in cons:
+            die_unknown_constraint(cid, cons)
+        c = edit_constraint(cid, text=args.text, lift=True)
+        render_index()
+        hits = churn_sorted(cites.get(cid, []))
+        if not hits:
+            print(f"lifted `{cid}` ({c['lifted']}) — nothing rested on it")
+            return
+        print(f"lifted `{cid}` ({c['lifted']}) — "
+              f"{plural(len(hits), 'decision')} rested on it:")
+        emit_hits(hits, DEFAULT_HITS, f"`shelf revisit {cid} -n {len(hits)}`",
+                  "→ re-decide with `shelf verdict <slug> <verdict>`", hide={cid})
+        return
+
+    if args.text is None:                       # read one — the bounded landing spot
+        if cid not in cons:
+            die_unknown_constraint(cid, cons)
+        c = cons[cid]
+        meta = [m for m in (f"since {c['since']}" if c["since"] else "",
+                            f"lifted {c['lifted']}" if c["lifted"] else "") if m]
+        suffix = f"  ({', '.join(meta)})" if meta else ""
+        count = f"×{n}" if n else ""
+        print(f"{cid:<14} {count:<3} {clip(c['text'], CONSTRAINT_CAP)}{suffix}")
+        return
+
+    if not CID_RE.match(cid):
+        die(f"bad constraint id: {cid}\n"
+            "  ids are lowercase, ≤24 chars, [a-z0-9._-] — e.g. `single-node`, `pg13`")
+    c = edit_constraint(cid, text=args.text)
+    render_index()
+    if c["created"]:
+        print(f"added `{cid}` (since {c['since']})")
+        print(f"  cite it:  shelf verdict <slug> rejected --because {cid}")
+    else:
+        verb = "cites" if n == 1 else "cite"
+        print(f"updated `{cid}`"
+              + (f" — {plural(n, 'decision')} {verb} it (`shelf revisit {cid}`)" if n else ""))
 
 
 def cmd_tags(args):
@@ -265,13 +810,18 @@ def cmd_tags(args):
             counts[t] = counts.get(t, 0) + 1
     for tag, n in sorted(counts.items(), key=lambda p: (-p[1], p[0])):
         print(f"{tag:<20} {n}")
-    print(f"{len(items)} items")
+    n_tool = sum(1 for i in items if kind_of(i) == "tool")
+    n_read = len(items) - n_tool
+    split = f" ({n_tool} tools, {n_read} reading)" if n_tool and n_read else ""
+    print(f"{len(items)} items{split}")
 
 
 def filtered(args) -> list:
     items = load()
     if getattr(args, "tag", None):
         items = [i for i in items if args.tag in tags_of(i)]
+    if getattr(args, "kind", None):
+        items = [i for i in items if kind_of(i) == args.kind]
     return items
 
 
@@ -279,7 +829,7 @@ def cmd_list(args):
     ensure_shelf()
     for i in filtered(args):
         print(
-            f"{i['name']:<26} {i['verdict'] or 'untried':<10} "
+            f"{i['name']:<26} {verdict_of(i):<10} "
             f"{','.join(tags_of(i)):<24} {clip(i['why'], 58)}"
         )
 
@@ -288,19 +838,33 @@ def cmd_print(args):
     ensure_shelf()
     items = filtered(args)
     bold, dim, off = ("\033[1m", "\033[2m", "\033[0m") if colour_on() else ("", "", "")
-    groups: dict = {}
+    by_kind: dict = {}
     for i in items:
-        groups.setdefault(i["verdict"] or "untried", []).append(i)
-    print(f"\n{bold}Shelf{off} {dim}— {len(items)} items · {shelf_dir()}{off}\n")
-    for verdict in sorted(groups, key=lambda v: VERDICT_ORDER.get(v, 9)):
-        group = groups[verdict]
-        print(f"{bold}{verdict.upper()}{off} {dim}({len(group)}){off}")
+        by_kind.setdefault(kind_of(i), []).append(i)
+    headers = len(by_kind) > 1          # tool-only shelf renders exactly as it did in v0.1
+    split = (f" · {len(by_kind.get('tool', ()))} tools, "
+             f"{len(by_kind.get('reading', ()))} reading") if headers else ""
+    print(f"\n{bold}Shelf{off} {dim}— {len(items)} items{split} · {shelf_dir()}{off}\n")
+    for kind in KINDS:
+        group = by_kind.get(kind)
+        if not group:
+            continue
+        pad = ""
+        if headers:
+            print(f"{bold}{KIND_LABEL[kind]}{off} {dim}({len(group)}){off}\n")
+            pad = "  "
+        groups: dict = {}
         for i in group:
-            print(f"  {i['name']:<24} {dim}{','.join(tags_of(i))}{off}")
-            if i["why"]:
-                print(f"  {'':<24}{clip(i['why'], 88)}")
-            print(f"  {dim}{'':<24}{i['url']}{off}")
-        print()
+            groups.setdefault(verdict_of(i), []).append(i)
+        for verdict in sorted(groups, key=lambda v: VERDICT_ORDER.get(v, 9)):
+            rows = groups[verdict]
+            print(f"{pad}{bold}{verdict.upper()}{off} {dim}({len(rows)}){off}")
+            for i in rows:
+                print(f"{pad}  {i['name']:<24} {dim}{','.join(tags_of(i))}{off}")
+                if i["why"]:
+                    print(f"{pad}  {'':<24}{clip(i['why'], 88)}")
+                print(f"{pad}  {dim}{'':<24}{i['url']}{off}")
+            print()
 
 
 def cmd_show(args):
@@ -308,7 +872,12 @@ def cmd_show(args):
     path = items_dir() / f"{args.slug}.md"
     if not path.exists():
         die(f"no such item: {args.slug} — try `shelf find {args.slug}`")
-    print(path.read_text(encoding="utf-8"), end="")
+    text = path.read_text(encoding="utf-8")
+    print(text, end="")
+    found = re.search(r"^verdict:\s*(\w+)", text, re.M)
+    verdict = found.group(1) if found else ""
+    log_event("show", slug=args.slug, v=VERDICT_CODE.get(verdict, "u"),
+              tty=int(sys.stdout.isatty()))
 
 
 def cmd_edit(args):
@@ -325,40 +894,202 @@ def cmd_verdict(args):
     path = items_dir() / f"{args.slug}.md"
     if not path.exists():
         die(f"no such item: {args.slug}")
-    text = path.read_text(encoding="utf-8")
-    if re.search(r"^verdict:.*$", text, re.M):
-        text = re.sub(r"^verdict:.*$", f"verdict: {args.verdict}", text, count=1, flags=re.M)
-    else:
-        text = text.replace("---", f"---\nverdict: {args.verdict}", 1)
+    item = parse(path)
+    kind = kind_of(item)
+    other = "reading" if kind == "tool" else "tool"
+    if args.verdict not in VERDICTS_BY_KIND[kind]:
+        die(f"`{args.verdict}` is a {other} verdict, and {args.slug} is {kind}\n"
+            f"  {kind} verdicts: {' · '.join(VERDICTS_BY_KIND[kind])}\n"
+            f"  (or change the item: shelf kind {args.slug} {other})")
+    ids = None
+    if args.because is not None:
+        ids = split_csv(args.because)
+        known = {c["id"]: c for c in load_constraints()}
+        for cid in ids:
+            if not CID_RE.match(cid) or cid not in known:
+                die_unknown_constraint(cid, known)
+            if known[cid]["lifted"]:
+                print(f"note: `{cid}` was lifted {known[cid]['lifted']} — citing it anyway",
+                      file=sys.stderr)
+    text = upsert_field(path.read_text(encoding="utf-8"), "verdict", args.verdict)
+    if ids is not None:
+        text = upsert_field(text, "because", f"[{','.join(ids)}]" if ids else "")
     path.write_text(text, encoding="utf-8")
     render_index()
-    print(f"{args.slug} → {args.verdict}")
+    print(f"{args.slug} → {args.verdict}" + (f" · because {','.join(ids)}" if ids else ""))
     print("  say why in the note: shelf edit " + args.slug)
+
+
+def cmd_kind(args):
+    """Read or change an item's kind. Swaps the scaffold only while the body is still
+    the untouched template, and migrates the verdict only when it is the old default."""
+    ensure_shelf()
+    path = items_dir() / f"{args.slug}.md"
+    if not path.exists():
+        die(f"no such item: {args.slug}")
+    item = parse(path)
+    old = kind_of(item)
+    if not args.kind:
+        print(old)
+        return
+    new = args.kind
+    text = upsert_field(path.read_text(encoding="utf-8"), "kind", new)
+    pristine = (item["body"] or "").strip() == TEMPLATES[old].strip()
+    end = text.find("\n---", 3)
+    if pristine and end >= 0:
+        text = text[: end + 4] + "\n" + TEMPLATES[new].rstrip() + "\n"
+    current = (item["verdict"] or "").strip()
+    migrate = not current or current == DEFAULT_VERDICT[old]
+    if migrate:
+        text = upsert_field(text, "verdict", DEFAULT_VERDICT[new])
+    path.write_text(text, encoding="utf-8")
+    render_index()
+    print(f"{args.slug} → {new}")
+    print("  scaffold swapped (note body was still empty)" if pristine
+          else "  note body kept — it has your writing in it")
+    if migrate:
+        print(f"  verdict {current or DEFAULT_VERDICT[old]} → {DEFAULT_VERDICT[new]}")
+    elif current not in VERDICTS_BY_KIND[new]:
+        print(f"  warning: verdict `{current}` is not a {new} verdict")
+        print(f"           set one of: {' · '.join(VERDICTS_BY_KIND[new])}")
 
 
 def cmd_path(args):
     print(shelf_dir())
 
 
+def days_between(start: str, end: str) -> int:
+    try:
+        delta = datetime.datetime.fromisoformat(end) - datetime.datetime.fromisoformat(start)
+        return max(delta.days, 0)
+    except ValueError:
+        return 0
+
+
+def days_since(date: str) -> int:
+    try:
+        return (datetime.date.today() - datetime.date.fromisoformat(date)).days
+    except ValueError:
+        return 10_000  # no `added` date: treat as old enough to judge
+
+
+def cmd_stats(args):
+    """HUMAN: is the shelf changing decisions? Linear in shelf size — not for agents."""
+    ensure_shelf()
+    if args.off:
+        (shelf_dir() / LOG_OFF_NAME).write_text("usage logging off\n", encoding="utf-8")
+        log_path().unlink(missing_ok=True)
+        print(f"usage logging off — {log_path()} deleted. back on with `shelf stats --on`")
+        return
+    if args.on:
+        (shelf_dir() / LOG_OFF_NAME).unlink(missing_ok=True)
+        print(f"usage logging on — find/show recorded locally in {log_path()}")
+        return
+    acc = new_stats()
+    for rec in read_log():
+        fold(acc, rec)
+    items = load()
+    counts = acc["items"]
+    if args.json:
+        print(json.dumps(acc, indent=2, sort_keys=True))
+        return
+
+    bold, dim, off = ("\033[1m", "\033[2m", "\033[0m") if colour_on() else ("", "", "")
+    if not acc["finds"] and not acc["shows"]:
+        print("nothing retrieved yet — the log starts on your next `shelf find`")
+        if logging_off():
+            print("(logging is off — turn it back on with `shelf stats --on`)")
+        return
+    window = days_between(acc["since"], acc["to"]) or 1
+    kept = acc["finds"] - acc["misses"]
+    print(f"\n{bold}Shelf impact{off} {dim}— {len(items)} items · {window}d "
+          f"since {acc['since'][:10]}{off}\n")
+    total = acc["finds"] + acc["shows"]
+    print(f"  {'searches':<16}{acc['finds']:>6,}   {kept:,} hit "
+          f"({100 * kept // max(acc['finds'], 1)}%) · {acc['misses']:,} missed")
+    print(f"  {'notes opened':<16}{acc['shows']:>6,}")
+    print(f"  {'retrievals':<16}{total:>6,}   {dim}{acc['piped']:,} piped (an agent, most likely) · "
+          f"{total - acc['piped']:,} at a terminal (you){off}")
+
+    order = sorted(acc["surfaced"], key=lambda v: VERDICT_ORDER.get(v, 9))
+    print("\n  " + f"{'surfaced':<16}" + " · ".join(f"{v} {acc['surfaced'][v]:,}" for v in order))
+    print(f"  {bold}{'re-research':<16}{acc['opened'].get('rejected', 0):>6,}{off}   "
+          f"rejected notes opened {dim}· {acc['surfaced'].get('rejected', 0):,} rejected "
+          f"verdicts surfaced in results{off}")
+
+    ranked = sorted(counts.items(), key=lambda p: (-(p[1][0] + p[1][1]), p[0]))
+    if ranked:
+        print(f"\n{bold}most retrieved{off}")
+        by_slug = {i["name"]: i for i in items}
+        for slug, (f, s) in ranked[:STATS_TOP]:
+            item = by_slug.get(slug)
+            print(f"  {slug:<26}{f + s:>4}  {dim}find {f} · show {s}{off}  "
+                  f"{verdict_of(item) if item else 'deleted'}")
+
+    if acc["missed"]:
+        misses = sorted(acc["missed"].items(), key=lambda p: (-p[1], p[0]))[:STATS_TOP]
+        print(f"\n{bold}missed searches{off} {dim}— gaps worth shelving{off}")
+        for query, n in misses:
+            print(f"  {clip(query, 40):<26}{n:>4}")
+
+    dead = sorted((i for i in items if not counts.get(i["name"])
+                   and min(window, days_since(i["added"])) >= DEAD_GRACE_DAYS),
+                  key=lambda i: i["added"])
+    if dead:
+        print(f"\n{bold}never retrieved{off} {dim}— {len(dead)} of {len(items)} items, "
+              f"shelved >{DEAD_GRACE_DAYS}d and never surfaced{off}")
+        for i in (dead if args.dead else dead[:STATS_TOP]):
+            print(f"  {i['name']:<26}{dim}added {i['added']}  {','.join(tags_of(i))}{off}")
+        if not args.dead and len(dead) > STATS_TOP:
+            print(f"  {dim}… {len(dead) - STATS_TOP} more — `shelf stats --dead`{off}")
+    print()
+
+
 def render_index():
     items = load()
+    cons = load_constraints()
+    cites = citations()
     out = [
         "# Shelf",
         "",
         "Things that might be useful on a future project.",
         "Generated by [shelf](https://github.com/jhammant/shelf) — do not edit by hand.",
         "",
-        "| Item | Why it's here | Tags | Verdict | Added |",
-        "| --- | --- | --- | --- | --- |",
     ]
+    if cons:
+        out += ["## Constraints", ""]
+        for c in cons:
+            n = len(cites.get(c["id"], ()))
+            text = c["text"].replace("|", "\\|")
+            state = f" — lifted {c['lifted']}" if c["lifted"] else ""
+            cited = f" · {n} cited" if n else ""
+            out.append(f"- `{c['id']}` — {text}{state}{cited}")
+        out.append("")
+    by_kind: dict = {}
     for i in items:
-        link = f"[{i['name']}]({i['url']})" if i["url"] else i["name"]
-        why = i["why"].replace("|", "\\|")
-        out.append(
-            f"| {link} · [notes](items/{i['name']}.md) | {why} "
-            f"| {','.join(tags_of(i))} | {i['verdict'] or 'untried'} | {i['added']} |"
-        )
-    out += ["", "_Verdicts: `untried` · `trialling` · `adopted` · `rejected`._"]
+        by_kind.setdefault(kind_of(i), []).append(i)
+    headers = len(by_kind) > 1
+    for kind in KINDS:
+        group = by_kind.get(kind)
+        if not group:
+            continue
+        if headers:
+            out += [f"## {KIND_TITLE[kind]}", ""]
+        out += ["| Item | Why it's here | Tags | Verdict | Added |",
+                "| --- | --- | --- | --- | --- |"]
+        for i in group:
+            link = f"[{i['name']}]({i['url']})" if i["url"] else i["name"]
+            why = i["why"].replace("|", "\\|")
+            ids = because_of(i)
+            verdict = verdict_of(i) + (f" ({','.join(ids)})" if ids else "")
+            out.append(
+                f"| {link} · [notes](items/{i['name']}.md) | {why} "
+                f"| {','.join(tags_of(i))} | {verdict} | {i['added']} |"
+            )
+        legend = " · ".join(f"`{v}`" for v in VERDICTS_BY_KIND[kind])
+        out += ["", f"_Verdicts: {legend}._", ""]
+    while out and out[-1] == "":
+        out.pop()
     (shelf_dir() / "README.md").write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
@@ -386,6 +1117,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("-w", "--why", default="", help="why it caught your eye")
     a.add_argument("-t", "--tags", default="", help="comma-separated tags")
     a.add_argument("-s", "--slug", default="", help="override the derived slug")
+    a.add_argument("-k", "--kind", choices=KINDS, default="",
+                   help="tool or reading (inferred from the url by default)")
     a.add_argument("-c", "--clone", action="store_true", help="also shallow-clone the repo")
     a.add_argument("--offline", action="store_true", help="skip GitHub metadata lookup")
     a.set_defaults(fn=cmd_add)
@@ -393,16 +1126,18 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("find", help="ranked search, capped (start here)")
     f.add_argument("query", nargs="+")
     f.add_argument("-n", type=int, default=DEFAULT_HITS, help=f"max hits (default {DEFAULT_HITS})")
+    f.add_argument("-k", "--kind", choices=KINDS, default="", help="only tools, or only reading")
     f.set_defaults(fn=cmd_find)
 
     sub.add_parser("tags", help="tag vocabulary and counts").set_defaults(fn=cmd_tags)
 
     for name, fn, helptext in (
         ("list", cmd_list, "one terse line per item"),
-        ("print", cmd_print, "browsable view, grouped by verdict"),
+        ("print", cmd_print, "browsable view, grouped by kind then verdict"),
     ):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("tag", nargs="?", default="", help="filter by tag")
+        s.add_argument("-k", "--kind", choices=KINDS, default="", help="filter by kind")
         s.set_defaults(fn=fn)
 
     for name, fn, helptext in (
@@ -414,10 +1149,44 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("slug")
         s.set_defaults(fn=fn)
 
-    v = sub.add_parser("verdict", help="set untried/trialling/adopted/rejected")
+    v = sub.add_parser("verdict", help="record a decision")
     v.add_argument("slug")
-    v.add_argument("verdict", choices=VERDICTS)
+    v.add_argument("verdict", choices=VERDICTS, metavar="VERDICT",
+                   help="tool: untried|trialling|adopted|rejected · "
+                        "reading: unread|useful|noise")
+    v.add_argument("--because", default=None, metavar="IDS",
+                   help="constraint id(s) this decision rests on")
     v.set_defaults(fn=cmd_verdict)
+
+    k = sub.add_parser("kind", help="read or change tool/reading")
+    k.add_argument("slug")
+    # default=None, not "": argparse <=3.8 runs _check_value on a *string* default for a
+    # nargs='?' positional, so `shelf kind <slug>` in read mode would exit 2 on 3.8.
+    k.add_argument("kind", nargs="?", choices=KINDS, default=None)
+    k.set_defaults(fn=cmd_kind)
+
+    sub.add_parser("constraints",
+                   help="the standing facts — load once per session").set_defaults(fn=cmd_constraints)
+
+    c = sub.add_parser("constraint", help="add / read / lift / drop one standing fact")
+    c.add_argument("id")
+    c.add_argument("text", nargs="?", default=None)
+    c.add_argument("--lift", action="store_true", help="no longer true — show what rested on it")
+    c.add_argument("--drop", action="store_true", help="delete the line (mistyped id)")
+    c.add_argument("--force", action="store_true", help="drop even while items cite it")
+    c.set_defaults(fn=cmd_constraint)
+
+    r = sub.add_parser("revisit", help="decisions resting on a constraint, capped")
+    r.add_argument("id")
+    r.add_argument("-n", type=int, default=DEFAULT_HITS, help=f"max hits (default {DEFAULT_HITS})")
+    r.set_defaults(fn=cmd_revisit)
+
+    st = sub.add_parser("stats", help="HUMAN: is the shelf earning its keep? (grows with shelf)")
+    st.add_argument("--dead", action="store_true", help="every never-retrieved item, not just 8")
+    st.add_argument("--json", action="store_true", help="machine-readable dump of the counters")
+    st.add_argument("--off", action="store_true", help="stop logging and delete the log")
+    st.add_argument("--on", action="store_true", help="resume logging")
+    st.set_defaults(fn=cmd_stats)
 
     sub.add_parser("index", help="regenerate the shelf README").set_defaults(fn=cmd_index)
     sub.add_parser("path", help="print the shelf directory").set_defaults(fn=cmd_path)
