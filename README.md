@@ -2,7 +2,10 @@
 
 [![test](https://github.com/jhammant/shelf/actions/workflows/test.yml/badge.svg)](https://github.com/jhammant/shelf/actions/workflows/test.yml)
 
-**Your coding agent keeps recommending tools you already evaluated and rejected.**
+**A virtual shelf for remembering the things you might need — and the things you looked at
+and decided not to use.**
+
+Your coding agent keeps recommending tools you already evaluated and rejected.
 
 You looked at that library six months ago and decided against it. You had good reasons.
 Those reasons are gone — buried in a chat log, a closed tab, a starred repo you'll never
