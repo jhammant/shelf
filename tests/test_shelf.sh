@@ -516,8 +516,11 @@ check "log records the find" '"op":"find"' "$(cat "$SHELF_DIR/log.jsonl")"
 check "log records the surfaced verdict" 'widget:a' "$(cat "$SHELF_DIR/log.jsonl")"
 check "log records the show" '"op":"show"' "$(cat "$SHELF_DIR/log.jsonl")"
 check "log is gitignored" "log.*" "$(cat "$SHELF_DIR/.gitignore")"
+# GNU stat first: on Linux `stat -f` means *filesystem* status, so it exits 0 with
+# the wrong answer and a BSD-first `||` chain never falls through. BSD stat has no
+# -c and exits 1, so this order is the only one that works on both.
 check_same "log is 0600" "600" \
-  "$(stat -f '%Lp' "$SHELF_DIR/log.jsonl" 2>/dev/null || stat -c '%a' "$SHELF_DIR/log.jsonl")"
+  "$(stat -c '%a' "$SHELF_DIR/log.jsonl" 2>/dev/null || stat -f '%Lp' "$SHELF_DIR/log.jsonl")"
 
 # --- a shelf whose .gitignore predates the feature gets the entry on first write
 printf 'repos/\n' > "$SHELF_DIR/.gitignore"
