@@ -11,15 +11,22 @@ SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SHELF_DIR" "$SCRATCH"' EXIT
 
 pass=0; fail=0
+# Substring tests use bash pattern matching, not `printf | grep -qF`. With a large
+# haystack (a whole README) grep -q exits on the first match while printf is still
+# writing, printf takes SIGPIPE, and `set -o pipefail` then fails the pipeline even
+# though the substring WAS found — a race that only shows up on big inputs. Quoting
+# "$2" inside the pattern keeps it literal, so glob metacharacters are safe.
+contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
 check() { # check <name> <expected-substring> <actual>
-  if printf '%s' "$3" | grep -qF -- "$2"; then
+  if contains "$2" "$3"; then
     pass=$((pass + 1)); printf '  ok   %s\n' "$1"
   else
     fail=$((fail + 1)); printf '  FAIL %s\n       want substring: %s\n       got: %s\n' "$1" "$2" "$3"
   fi
 }
 check_not() {
-  if printf '%s' "$3" | grep -qF -- "$2"; then
+  if contains "$2" "$3"; then
     fail=$((fail + 1)); printf '  FAIL %s\n       unwanted substring present: %s\n' "$1" "$2"
   else
     pass=$((pass + 1)); printf '  ok   %s\n' "$1"
